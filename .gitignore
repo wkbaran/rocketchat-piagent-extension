@@ -1,0 +1,15 @@
+# Dependencies
+node_modules/
+
+# Compiled output
+index.js
+
+# Runtime state (contains message timestamps — machine-specific)
+state.json
+
+# Logs
+*.log
+
+# Backup / scratch files
+*.bad
+*.bak

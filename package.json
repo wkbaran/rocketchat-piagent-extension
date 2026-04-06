@@ -1,0 +1,13 @@
+{
+  "name": "rocketchat-extension",
+  "version": "1.0.0",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "devDependencies": {
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2"
+  }
+}
