@@ -10,7 +10,6 @@
  *     "serverUrl": "https://chat.example.com",
  *     "username": "pi-bot",
  *     "password": "secret",
- *     "channels": ["general"],
  *     "prefix": "!",
  *     "workflows": {
  *       "channel-name": {
@@ -39,7 +38,7 @@ interface RocketChatConfig {
   serverUrl: string;
   username: string;
   password: string;
-  channels: string[];
+  channels?: string[]; // Optional whitelist. If omitted, all joined channels are monitored.
   prefix?: string;
   dm?: boolean;
 }
