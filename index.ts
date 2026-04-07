@@ -426,6 +426,72 @@ function clearChannelSession(channelName: string): void {
   rcLog("INFO", `Session cleared for #${channelName}`);
 }
 
+/**
+ * Handle the !set-model command sent from a Rocket.Chat channel.
+ * Updates channelWorkflows so the next session creation uses the new model,
+ * then clears the current session to force a fresh start.
+ */
+async function handleSetModelCommand(roomId: string, roomName: string, args: string): Promise<void> {
+  if (!rocketChatClient?.isConnected()) return;
+  const { modelRegistry } = getSharedAuth();
+
+  // No args → show current model for this channel
+  if (!args) {
+    const current = channelWorkflows[roomName]?.model;
+    const reply = current
+      ? `Current model for **#${roomName}**: \`${current.provider}/${current.id}\``
+      : `No model override set for **#${roomName}** (using session default).`;
+    await rocketChatClient.sendMessage(roomId, reply);
+    return;
+  }
+
+  // list → enumerate models available to the RC sessions
+  if (args === "list") {
+    const available = await modelRegistry.getAvailable();
+    const names = available.map((m: any) => `\`${m.provider}/${m.id}\``).join("\n");
+    await rocketChatClient.sendMessage(roomId, `Available models:\n${names || "(none)"}`);
+    return;
+  }
+
+  // clear / reset → remove per-channel override
+  if (args === "clear" || args === "reset") {
+    if (channelWorkflows[roomName]) delete channelWorkflows[roomName].model;
+    clearChannelSession(roomName);
+    await rocketChatClient.sendMessage(roomId, `✅ Model override cleared for **#${roomName}**. Session reset.`);
+    return;
+  }
+
+  // Set a specific model: parse [provider/]model-id
+  const slashIdx = args.indexOf("/");
+  const provider = slashIdx !== -1 ? args.slice(0, slashIdx) : undefined;
+  const modelId  = slashIdx !== -1 ? args.slice(slashIdx + 1) : args;
+
+  const available = await modelRegistry.getAvailable();
+  const found = provider
+    ? available.find((m: any) => m.provider === provider && m.id === modelId)
+    : available.find((m: any) => m.id === modelId);
+
+  if (!found) {
+    const names = available.map((m: any) => `${m.provider}/${m.id}`).join(", ");
+    await rocketChatClient.sendMessage(
+      roomId,
+      `❌ Model not found: \`${args}\`\nAvailable: ${names || "(none)"}`
+    );
+    return;
+  }
+
+  // Persist into channelWorkflows so createChannelSession picks it up
+  if (!channelWorkflows[roomName]) channelWorkflows[roomName] = {};
+  channelWorkflows[roomName].model = { provider: found.provider, id: found.id };
+  clearChannelSession(roomName); // session recreated with new model on next message
+
+  await rcLog("INFO", `[#${roomName}] Model changed to ${found.provider}/${found.id} via !set-model`);
+  await rocketChatClient.sendMessage(
+    roomId,
+    `✅ Model for **#${roomName}** set to \`${found.provider}/${found.id}\`. Session reset — next message starts fresh.`
+  );
+}
+
 /** Dispose all channel sessions (called on shutdown). */
 function disposeAllSessions(): void {
   for (const [name, state] of channelStates) {
@@ -553,20 +619,32 @@ async function checkMessages(): Promise<void> {
         ts.setMilliseconds(ts.getMilliseconds() + 1);
         lastMessageTimestamps.set(room._id, ts);
 
-        // Built-in clear-context command (always recognised, no prefix needed)
-        if (msg.msg.toLowerCase() === "!clear-context") {
-          clearChannelSession(roomName);
-          await rocketChatClient.sendMessage(
-            room._id,
-            "Context cleared. Next message will start with fresh history."
-          );
+        // "!" prefix → bot command, never forwarded to the AI.
+        if (msg.msg.startsWith("!")) {
+          const commandText = msg.msg.slice(1).trim();
+          const spaceIdx = commandText.search(/\s/);
+          const commandName = (spaceIdx === -1 ? commandText : commandText.slice(0, spaceIdx)).toLowerCase();
+          const commandArgs = spaceIdx === -1 ? "" : commandText.slice(spaceIdx + 1).trim();
+
+          if (commandName === "clear-context") {
+            clearChannelSession(roomName);
+            await rocketChatClient.sendMessage(
+              room._id,
+              "✅ Context cleared. Next message will start with fresh history."
+            );
+          } else if (commandName === "set-model") {
+            await handleSetModelCommand(room._id, roomName, commandArgs);
+          } else {
+            await rocketChatClient.sendMessage(
+              room._id,
+              `❌ Unknown command \`!${commandName}\`. Available: \`!set-model\`, \`!clear-context\``
+            );
+          }
           continue;
         }
 
-        // Prefix filtering
-        const prefix = config.prefix !== undefined ? config.prefix : "!";
-        if (prefix && !msg.msg.startsWith(prefix)) continue;
-        const text = prefix ? msg.msg.slice(prefix.length).trim() : msg.msg;
+        // Not a command — forward to the AI model.
+        const text = msg.msg.trim();
         if (!text) continue;
 
         const wf = channelWorkflows[roomName];
@@ -720,6 +798,59 @@ export default function (pi: ExtensionAPI) {
       }
       clearChannelSession(channel);
       ctx.ui.notify(`Cleared context for #${channel}. Next message starts fresh.`, "info");
+    },
+  });
+
+  pi.registerCommand("rocketchat-set-model", {
+    description: "Set AI model for a RC channel — usage: <channel> <provider/model-id> | clear",
+    handler: async (args, ctx) => {
+      const parts = args.trim().split(/\s+/);
+      if (parts.length < 2) {
+        ctx.ui.notify("Usage: /rocketchat-set-model <channel> <provider/model-id>  (or 'clear')", "error");
+        return;
+      }
+      const channelName = parts[0].replace(/^#/, "");
+      const modelSpec   = parts.slice(1).join(" ");
+      const { modelRegistry } = getSharedAuth();
+
+      if (modelSpec === "clear" || modelSpec === "reset") {
+        if (channelWorkflows[channelName]) delete channelWorkflows[channelName].model;
+        clearChannelSession(channelName);
+        ctx.ui.notify(`Model override cleared for #${channelName}`, "info");
+        return;
+      }
+
+      const slashIdx = modelSpec.indexOf("/");
+      const provider = slashIdx !== -1 ? modelSpec.slice(0, slashIdx) : undefined;
+      const modelId  = slashIdx !== -1 ? modelSpec.slice(slashIdx + 1) : modelSpec;
+      const available = await modelRegistry.getAvailable();
+      const found = provider
+        ? available.find((m: any) => m.provider === provider && m.id === modelId)
+        : available.find((m: any) => m.id === modelId);
+
+      if (!found) {
+        const names = available.map((m: any) => `${m.provider}/${m.id}`).join(", ");
+        ctx.ui.notify(`Model not found: ${modelSpec}\nAvailable: ${names}`, "error");
+        return;
+      }
+
+      if (!channelWorkflows[channelName]) channelWorkflows[channelName] = {};
+      channelWorkflows[channelName].model = { provider: found.provider, id: found.id };
+      clearChannelSession(channelName);
+      ctx.ui.notify(`#${channelName} → ${found.provider}/${found.id} (session reset)`, "success");
+    },
+  });
+
+  pi.registerCommand("rocketchat-model-status", {
+    description: "Show per-channel model assignments",
+    handler: async (_args, ctx) => {
+      const entries = Object.entries(channelWorkflows)
+        .filter(([, wf]) => wf.model)
+        .map(([ch, wf]) => `#${ch}: ${wf.model!.provider}/${wf.model!.id}`);
+      ctx.ui.notify(
+        entries.length ? entries.join("\n") : "No per-channel model overrides set.",
+        "info"
+      );
     },
   });
 
